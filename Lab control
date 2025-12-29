@@ -1,0 +1,187 @@
+import sys
+import time
+import pandas as pd
+import random
+from datetime import datetime
+
+# 强制指定 Matplotlib 后端，防止与 PyQt6 冲突
+import matplotlib
+matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                             QTableWidget, QTableWidgetItem, QMessageBox, QTabWidget)
+from PyQt6.QtCore import QThread, pyqtSignal
+
+# --- 模拟硬件通信 ---
+class HardwareInterface:
+    def read_sensors(self):
+        # 模拟：[流速1-4, 温度1-2]
+        flows = [10.0 + random.uniform(-0.5, 0.5) for _ in range(4)]
+        temps = [25.0 + random.uniform(-0.2, 0.2) for _ in range(2)]
+        return flows + temps
+
+# --- 控制逻辑线程 ---
+class ControlThread(QThread):
+    data_update = pyqtSignal(list)
+    plot_update = pyqtSignal(list, list)
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.is_running = True
+        self.hw = HardwareInterface()
+        self.log_data = []
+        
+        # 解析程序 (时间:值)
+        self.temp_prog = self._parse(params['temp'])
+        self.flow_prog = self._parse(params['flow'])
+
+    def _parse(self, s):
+        try:
+            return sorted([(int(i.split(':')[0]), float(i.split(':')[1])) for i in s.split(',')], key=lambda x: x[0])
+        except:
+            return [(0, 0.0)]
+
+    def _get_val(self, prog, elapsed):
+        if elapsed <= prog[0][0]: return prog[0][1]
+        for i in range(len(prog)-1):
+            t0, v0 = prog[i]
+            t1, v1 = prog[i+1]
+            if t0 <= elapsed < t1:
+                return v0 + (v1 - v0) * (elapsed - t0) / (t1 - t0)
+        return prog[-1][1]
+
+    def run(self):
+        start_t = time.time()
+        while self.is_running:
+            elapsed = int(time.time() - start_t)
+            t_set = self._get_val(self.temp_prog, elapsed)
+            f_set = self._get_val(self.flow_prog, elapsed)
+            
+            readings = self.hw.read_sensors()
+            row = [datetime.now().strftime("%H:%M:%S")] + readings
+            
+            self.log_data.append(row)
+            self.data_update.emit(row)
+            # 发送绘图数据: 经过时间, [实际F, 实际T, 设定F, 设定T]
+            self.plot_update.emit([elapsed], [readings[0], readings[4], f_set, t_set])
+            
+            self.msleep(1000) # 线程安全暂停 1秒
+
+    def stop(self):
+        self.is_running = False
+        df = pd.DataFrame(self.log_data, columns=["Time", "F1", "F2", "F3", "F4", "T1", "T2"])
+        df.to_csv(f"data_{datetime.now().strftime('%H%M%S')}.csv", index=False)
+        self.quit()
+        self.wait()
+
+# --- 主界面 ---
+class ControlPanel(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("流量温度控制系统")
+        self.resize(1000, 700)
+        self.init_ui()
+        self.time_data = []
+        self.f_act, self.t_act = [], []
+        self.f_set, self.t_set = [], []
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        # 输入区域
+        input_box = QHBoxLayout()
+        self.temp_input = QLineEdit("0:25,30:50,60:50")
+        self.flow_input = QLineEdit("0:10,30:20,60:5")
+        input_box.addWidget(QLabel("温度程序:"))
+        input_box.addWidget(self.temp_input)
+        input_box.addWidget(QLabel("流量程序:"))
+        input_box.addWidget(self.flow_input)
+        
+        self.btn_start = QPushButton("开始")
+        self.btn_stop = QPushButton("停止并保存")
+        self.btn_stop.setEnabled(False)
+        input_box.addWidget(self.btn_start)
+        input_box.addWidget(self.btn_stop)
+        layout.addLayout(input_box)
+
+        # Tab 切换
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Tab 1: 表格
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["时间", "F1", "F2", "F3", "F4", "T1", "T2"])
+        self.tabs.addTab(self.table, "数据列表")
+
+        # Tab 2: 图表
+        chart_widget = QWidget()
+        chart_layout = QVBoxLayout(chart_widget)
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        chart_layout.addWidget(self.canvas)
+        self.tabs.addTab(chart_widget, "实时图表")
+        
+        # 信号连接
+        self.btn_start.clicked.connect(self.start)
+        self.btn_stop.clicked.connect(self.stop)
+
+    def start(self):
+        params = {"temp": self.temp_input.text(), "flow": self.flow_input.text()}
+        self.thread = ControlThread(params)
+        self.thread.data_update.connect(self.on_data)
+        self.thread.plot_update.connect(self.on_plot)
+        
+        # 重置绘图数据
+        self.time_data.clear()
+        self.f_act.clear(); self.t_act.clear()
+        self.f_set.clear(); self.t_set.clear()
+        
+        self.thread.start()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+
+    def stop(self):
+        self.thread.stop()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        QMessageBox.information(self, "提示", "实验已停止并生成CSV文件")
+
+    def on_data(self, row):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        for i, v in enumerate(row):
+            item = QTableWidgetItem(str(v) if isinstance(v, str) else f"{v:.2f}")
+            self.table.setItem(r, i, item)
+        self.table.scrollToBottom()
+
+    def on_plot(self, t, vals):
+        self.time_data.extend(t)
+        self.f_act.append(vals[0]); self.t_act.append(vals[1])
+        self.f_set.append(vals[2]); self.t_set.append(vals[3])
+
+        self.fig.clear()
+        ax1 = self.fig.add_subplot(111)
+        ax2 = ax1.twinx()
+
+        ax1.plot(self.time_data, self.f_act, 'b-', label='实际流量')
+        ax1.plot(self.time_data, self.f_set, 'b--', alpha=0.5, label='设定流量')
+        ax2.plot(self.time_data, self.t_act, 'r-', label='实际温度')
+        ax2.plot(self.time_data, self.t_set, 'r--', alpha=0.5, label='设定温度')
+
+        ax1.set_ylabel('流量 (L/min)', color='b')
+        ax2.set_ylabel('温度 (℃)', color='r')
+        ax1.legend(loc='upper left')
+        self.canvas.draw()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ControlPanel()
+    window.show()
+    sys.exit(app.exec())
